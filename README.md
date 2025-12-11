@@ -91,6 +91,8 @@ In the report you get:
   ```text
   51.23.25.22(zen.spamhaus.org)
   ```
+---
+
 ### PTR (reverse DNS)
 
 For each IP from SPF:
@@ -109,7 +111,9 @@ n/a — no IPs to check (no ip4: in SPF).
 
 Missing or partial PTR is often a reputation and deliverability red flag.
 
-  
+
+---
+
 ### Overall Status
 
 The tool computes an overall status per domain using SPF, DMARC, MX, RBL and PTR:
@@ -148,8 +152,10 @@ and DNS / reputation look healthy.
 
 The Comment column contains a short explanation like:
 
+  ```text
 SPF missing; DMARC missing
 
 3 IP in RBL
 
 DMARC p=none; PTR missing for some IPs
+```
