@@ -153,28 +153,7 @@ The script needs DNS access (UDP/53) to perform lookups.
 
 ---
 
-## Installation
 
-1. Clone the repository or download the script:
-
-```bash
-git clone <REPOSITORY_URL>
-cd <REPO_FOLDER>
-```
-
-2. Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-If you don’t have a `requirements.txt`, install directly:
-
-```bash
-pip install dnspython prettytable
-```
-
----
 
 ## Usage
 
