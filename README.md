@@ -334,7 +334,7 @@ Add or remove DNSBLs depending on what you use in your environment.
 ```python
 COMMON_DKIM_SELECTORS = [
     "default", "selector1", "selector2", "google", "mail", "smtp",
-    "mx", "k1", "mailo", "s1", "s2", "dkim",
+    "mx", "k1", "mail1", "s1", "s2", "dkim",
 ]
 ```
 
