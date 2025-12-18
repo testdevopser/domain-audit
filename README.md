@@ -299,6 +299,8 @@ You can customize a few things inside the script:
 - `--csv report.csv` — export the same table to CSV for filtering/sorting later.
 - `--debug` — print DNS errors and timeouts to stderr for troubleshooting.
 - `--progress` — print per-domain progress updates while the scan runs.
+- `--no-rbl` — skip DNSBL checks entirely (fast, no load on DNSBLs).
+- `--rbl-delay 0.1` — delay between DNSBL queries (seconds) to avoid spamming lists; default: 0.1s.
 
 Duplicate domains in the input file are ignored automatically.
 
@@ -344,6 +346,8 @@ For your own domains, it can be useful to add the selectors you actually use (`d
 - **RBL usage**
   - Making large numbers of queries to DNSBLs may violate their usage policies.
   - Don’t run massive audits with thousands of IPs at high frequency.
+  - RBL lookups are cached per IP within one run and include a small delay between queries to reduce load.
+  - Use `--no-rbl` when you want a quick run without touching DNSBLs.
 - **Network/DNS**
   - The script depends entirely on DNS resolution.  
   - Network issues or DNS misconfiguration will show up as `missing`/`error`/`unknown`.

@@ -11,6 +11,7 @@ domains.txt: one domain per line, "#" for comments.
 import argparse
 import csv
 import sys
+import time
 from typing import List, Tuple, Dict, Optional, Set
 
 import dns.exception
@@ -34,9 +35,11 @@ COMMON_DKIM_SELECTORS = [
 DNS_TIMEOUT = 3.0
 DNS_LIFETIME = 5.0
 DNS_RETRIES = 2
+RBL_DELAY_SECONDS = 0.1
 
 ResolveResult = Tuple[str, Optional[dns.resolver.Answer], Optional[Exception]]
 DNS_CACHE: Dict[Tuple[str, str], ResolveResult] = {}
+RBL_CACHE: Dict[str, List[str]] = {}
 
 
 def load_domains(path: str) -> List[str]:
@@ -293,11 +296,19 @@ def check_dkim(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tup
         return "unknown", []
 
 
-def check_dnsbl(ip: str, resolver: dns.resolver.Resolver, debug: bool) -> List[str]:
+def check_dnsbl(
+    ip: str,
+    resolver: dns.resolver.Resolver,
+    debug: bool,
+    rbl_delay: float,
+) -> List[str]:
     """
     Проверка одного IP по всем DNSBL.
     Возвращает список DNSBL, где IP найден.
     """
+    if ip in RBL_CACHE:
+        return RBL_CACHE[ip]
+
     reversed_ip = ".".join(reversed(ip.split(".")))
     listed_in: List[str] = []
 
@@ -308,7 +319,10 @@ def check_dnsbl(ip: str, resolver: dns.resolver.Resolver, debug: bool) -> List[s
             listed_in.append(dnsbl)
         elif status == "error" and debug:
             print(f"[DEBUG] RBL lookup failed for {ip} at {dnsbl}", file=sys.stderr)
+        if rbl_delay > 0:
+            time.sleep(rbl_delay)
 
+    RBL_CACHE[ip] = listed_in
     return listed_in
 
 
@@ -414,6 +428,17 @@ def main() -> None:
         action="store_true",
         help="Print per-domain progress while processing",
     )
+    parser.add_argument(
+        "--no-rbl",
+        action="store_true",
+        help="Skip DNSBL checks (faster, no load on DNSBL providers)",
+    )
+    parser.add_argument(
+        "--rbl-delay",
+        type=float,
+        default=RBL_DELAY_SECONDS,
+        help=f"Delay between RBL queries in seconds (default: {RBL_DELAY_SECONDS})",
+    )
     args = parser.parse_args()
 
     domains = load_domains(args.domains_file)
@@ -472,12 +497,12 @@ def main() -> None:
         bad_ip_details: List[str] = []
 
         for ip in ip4_list:
-            listed_in = check_dnsbl(ip, resolver, args.debug)
-            if listed_in:
-                ip_listed_count += 1
-                # полные имена RBL, как вернул check_dnsbl
-                bad_ip_details.append(f"{ip}({','.join(listed_in)})")
-
+            if not args.no_rbl:
+                listed_in = check_dnsbl(ip, resolver, args.debug, args.rbl_delay)
+                if listed_in:
+                    ip_listed_count += 1
+                    # полные имена RBL, как вернул check_dnsbl
+                    bad_ip_details.append(f"{ip}({','.join(listed_in)})")
             has_ptr, hosts = check_ptr(ip, resolver, args.debug)
             ptr_total += 1
             if has_ptr:
@@ -485,13 +510,16 @@ def main() -> None:
 
 
         # RBL summary
-        if ip_count == 0:
-            rbl_summary = "n/a"
+        if args.no_rbl:
+            rbl_summary = "skipped"
         else:
-            if ip_listed_count == 0:
-                rbl_summary = f"✅ all {ip_count} clean"
+            if ip_count == 0:
+                rbl_summary = "n/a"
             else:
-                rbl_summary = f"❌ {ip_listed_count}/{ip_count} in RBL"
+                if ip_listed_count == 0:
+                    rbl_summary = f"✅ all {ip_count} clean"
+                else:
+                    rbl_summary = f"❌ {ip_listed_count}/{ip_count} in RBL"
 
         # Bad IPs summary
         if bad_ip_details:
