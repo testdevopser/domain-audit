@@ -25,7 +25,7 @@ DNSBL_LISTS = [
 # Популярные DKIM-селекторы (best effort, не истина в последней инстанции)
 COMMON_DKIM_SELECTORS = [
     "default", "selector1", "selector2", "google", "mail", "smtp",
-    "mx", "k1", "mail1", "s1", "s2", "dkim",
+    "mx", "k1", "mailo", "s1", "s2", "dkim",
 ]
 
 
@@ -129,7 +129,6 @@ def parse_spf(domain: str) -> Tuple[str, Optional[str], List[str]]:
 
     return status, raw_spf, ip4_list
 
-
 def parse_dmarc(domain: str) -> Tuple[str, Optional[str], bool]:
     """
     Возвращает (dmarc_status, raw_dmarc, rua_present)
@@ -140,6 +139,11 @@ def parse_dmarc(domain: str) -> Tuple[str, Optional[str], bool]:
         - "p=quarantine"
         - "p=reject"
         - "unknown"
+        - "multiple"   # несколько DMARC-записей с разными p=
+    raw_dmarc:
+        - все DMARC-записи, склеенные через " | "
+    rua_present:
+        - True, если хотя бы в одной записи есть rua=
     """
     dmarc_domain = f"_dmarc.{domain}"
     try:
@@ -155,33 +159,53 @@ def parse_dmarc(domain: str) -> Tuple[str, Optional[str], bool]:
             txt = b"".join(rdata.strings).decode("utf-8", errors="ignore")
         except AttributeError:
             txt = rdata.to_text().strip('"')
-        if txt.lower().startswith("v=dmarc1"):
+        if txt.lower().startswith("v=DMARC1".lower()):
             dmarc_records.append(txt)
 
     if not dmarc_records:
         return "missing", None, False
 
-    raw = dmarc_records[0]
-    tags: Dict[str, str] = {}
-    for part in raw.split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        tags[k.strip().lower()] = v.strip()
+    # Парсим все DMARC-записи
+    policies: List[str] = []
+    rua_present_any = False
 
-    p = tags.get("p", "").lower()
-    if p == "none":
-        status = "p=none"
-    elif p == "quarantine":
-        status = "p=quarantine"
-    elif p == "reject":
-        status = "p=reject"
-    else:
+    for raw in dmarc_records:
+        tags: Dict[str, str] = {}
+        for part in raw.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            tags[k.strip().lower()] = v.strip()
+
+        p = tags.get("p", "").lower()
+        if p:
+            policies.append(p)
+
+        if "rua" in tags and tags["rua"]:
+            rua_present_any = True
+
+    unique_policies = set(policies)
+
+    # Определяем статус
+    if not unique_policies:
         status = "unknown"
+    elif len(unique_policies) == 1:
+        p = next(iter(unique_policies))
+        if p == "none":
+            status = "p=none"
+        elif p == "quarantine":
+            status = "p=quarantine"
+        elif p == "reject":
+            status = "p=reject"
+        else:
+            status = "unknown"
+    else:
+        # Несколько разных p= — конфликтная конфигурация
+        status = "multiple"
 
-    rua_present = "rua" in tags and bool(tags["rua"])
-    return status, raw, rua_present
+    raw_combined = " | ".join(dmarc_records)
+    return status, raw_combined, rua_present_any
 
 
 def check_dkim(domain: str) -> Tuple[str, List[str]]:
@@ -285,6 +309,11 @@ def build_overall_status(
         fail_reasons.append("DMARC missing")
     elif dmarc_status == "p=none":
         warn_reasons.append("DMARC p=none")
+    elif dmarc_status == "multiple":
+        # несколько разных DMARC-записей — это ошибка конфигурации
+        fail_reasons.append("DMARC multiple records")
+    # "p=quarantine", "p=reject" и "unknown" тут считаем норм/терпимо
+
 
     # DKIM: "unknown" не считаем проблемой, это просто «не знаем селектор»
     # Если позже появится реальный статус "missing", можно будет сюда добавить warn/fail.
