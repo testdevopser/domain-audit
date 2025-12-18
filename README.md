@@ -171,6 +171,8 @@ else.com
 
 ```bash
 python3 audit_domains.py domains.txt
+# with optional CSV export and debug logging:
+python3 audit_domains.py domains.txt --csv report.csv --debug
 ```
 
 3. You’ll get a summary table, something like:
@@ -292,6 +294,16 @@ The **Comment** column briefly explains why the domain ended up with WARN/FAIL.
 
 You can customize a few things inside the script:
 
+### CLI options
+
+- `--csv report.csv` — export the same table to CSV for filtering/sorting later.
+- `--debug` — print DNS errors and timeouts to stderr for troubleshooting.
+- `--progress` — print per-domain progress updates while the scan runs.
+
+Duplicate domains in the input file are ignored automatically.
+
+---
+
 ### RBL Lists
 
 In the header of the script:
@@ -335,6 +347,7 @@ For your own domains, it can be useful to add the selectors you actually use (`d
 - **Network/DNS**
   - The script depends entirely on DNS resolution.  
   - Network issues or DNS misconfiguration will show up as `missing`/`error`/`unknown`.
+  - DNS lookups use short timeouts and a couple of retries to reduce random flakiness.
 
 ---
 
@@ -342,7 +355,6 @@ For your own domains, it can be useful to add the selectors you actually use (`d
 
 Ideas for future improvements:
 
-- Export results as **CSV / JSON**.
 - Extra detailed view per IP (PTR, full RBL listing in a separate table).
 - Optional expansion of SPF `include:` / `a` / `mx`.
 - Import DKIM selectors from real email headers (log/feed).

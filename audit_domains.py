@@ -3,14 +3,17 @@
 Email domain health checker.
 
 Usage:
-    python3 audit_domains.py domains.txt
+    python3 audit_domains.py domains.txt [--csv report.csv] [--debug]
 
 domains.txt: one domain per line, "#" for comments.
 """
 
+import argparse
+import csv
 import sys
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Set
 
+import dns.exception
 import dns.resolver
 import dns.reversename
 from prettytable import PrettyTable
@@ -28,31 +31,83 @@ COMMON_DKIM_SELECTORS = [
     "mx", "k1", "mail1", "s1", "s2", "dkim",
 ]
 
+DNS_TIMEOUT = 3.0
+DNS_LIFETIME = 5.0
+DNS_RETRIES = 2
+
+ResolveResult = Tuple[str, Optional[dns.resolver.Answer], Optional[Exception]]
+DNS_CACHE: Dict[Tuple[str, str], ResolveResult] = {}
+
 
 def load_domains(path: str) -> List[str]:
+    seen: Set[str] = set()
     domains: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            domains.append(line)
+            domain = line
+            if domain in seen:
+                continue
+            seen.add(domain)
+            domains.append(domain)
     return domains
 
 
-def check_mx(domain: str) -> Tuple[str, List[str]]:
+def make_resolver() -> dns.resolver.Resolver:
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = DNS_TIMEOUT
+    resolver.lifetime = DNS_LIFETIME
+    return resolver
+
+
+def resolve_dns(
+    resolver: dns.resolver.Resolver,
+    name: str,
+    rdtype: str,
+    tries: int,
+    debug: bool,
+) -> ResolveResult:
+    key = (name.lower(), rdtype.upper())
+    if key in DNS_CACHE:
+        return DNS_CACHE[key]
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(tries):
+        try:
+            answers = resolver.resolve(name, rdtype)
+            result: ResolveResult = ("ok", answers, None)
+            DNS_CACHE[key] = result
+            return result
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+            result = ("missing", None, None)
+            DNS_CACHE[key] = result
+            return result
+        except dns.exception.Timeout as exc:
+            last_exc = exc
+        except Exception as exc:
+            last_exc = exc
+
+    if debug and last_exc:
+        print(f"[DEBUG] DNS {name} {rdtype} failed after {tries} tries: {last_exc}", file=sys.stderr)
+    result = ("error", None, last_exc)
+    DNS_CACHE[key] = result
+    return result
+
+
+def check_mx(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tuple[str, List[str]]:
     """
     Проверка MX-записей.
     Возвращает:
         status: "OK", "missing", "error"
         hosts: список MX-хостов (строки)
     """
-    try:
-        answers = dns.resolver.resolve(domain, "MX")
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
-        return "missing", []
-    except Exception:
+    status, answers, _ = resolve_dns(resolver, domain, "MX", DNS_RETRIES, debug)
+    if status == "error":
         return "error", []
+    if answers is None:
+        return "missing", []
 
     hosts: List[str] = []
     for rdata in answers:
@@ -65,7 +120,7 @@ def check_mx(domain: str) -> Tuple[str, List[str]]:
     return "OK", hosts
 
 
-def parse_spf(domain: str) -> Tuple[str, Optional[str], List[str]]:
+def parse_spf(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tuple[str, Optional[str], List[str]]:
     """
     Возвращает (spf_status, raw_spf, ip4_list)
 
@@ -79,11 +134,10 @@ def parse_spf(domain: str) -> Tuple[str, Optional[str], List[str]]:
     ip4_list:
         список ip4: (только одиночные адреса, без диапазовов)
     """
-    try:
-        answers = dns.resolver.resolve(domain, "TXT")
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+    status, answers, _ = resolve_dns(resolver, domain, "TXT", DNS_RETRIES, debug)
+    if status == "error":
         return "missing", None, []
-    except Exception:
+    if answers is None:
         return "missing", None, []
 
     spf_records: List[str] = []
@@ -129,7 +183,7 @@ def parse_spf(domain: str) -> Tuple[str, Optional[str], List[str]]:
 
     return status, raw_spf, ip4_list
 
-def parse_dmarc(domain: str) -> Tuple[str, Optional[str], bool]:
+def parse_dmarc(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tuple[str, Optional[str], bool]:
     """
     Возвращает (dmarc_status, raw_dmarc, rua_present)
 
@@ -146,11 +200,10 @@ def parse_dmarc(domain: str) -> Tuple[str, Optional[str], bool]:
         - True, если хотя бы в одной записи есть rua=
     """
     dmarc_domain = f"_dmarc.{domain}"
-    try:
-        answers = dns.resolver.resolve(dmarc_domain, "TXT")
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+    status, answers, _ = resolve_dns(resolver, dmarc_domain, "TXT", DNS_RETRIES, debug)
+    if status == "error":
         return "missing", None, False
-    except Exception:
+    if answers is None:
         return "missing", None, False
 
     dmarc_records: List[str] = []
@@ -208,7 +261,7 @@ def parse_dmarc(domain: str) -> Tuple[str, Optional[str], bool]:
     return status, raw_combined, rua_present_any
 
 
-def check_dkim(domain: str) -> Tuple[str, List[str]]:
+def check_dkim(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tuple[str, List[str]]:
     """
     Перебираем набор популярных селекторов и ищем DKIM.
     Возвращает (dkim_status, selectors_found):
@@ -221,11 +274,8 @@ def check_dkim(domain: str) -> Tuple[str, List[str]]:
 
     for selector in COMMON_DKIM_SELECTORS:
         name = f"{selector}._domainkey.{domain}"
-        try:
-            answers = dns.resolver.resolve(name, "TXT")
-        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
-            continue
-        except Exception:
+        status, answers, _ = resolve_dns(resolver, name, "TXT", DNS_RETRIES, debug)
+        if status != "ok":
             continue
 
         for rdata in answers:
@@ -243,7 +293,7 @@ def check_dkim(domain: str) -> Tuple[str, List[str]]:
         return "unknown", []
 
 
-def check_dnsbl(ip: str) -> List[str]:
+def check_dnsbl(ip: str, resolver: dns.resolver.Resolver, debug: bool) -> List[str]:
     """
     Проверка одного IP по всем DNSBL.
     Возвращает список DNSBL, где IP найден.
@@ -253,26 +303,29 @@ def check_dnsbl(ip: str) -> List[str]:
 
     for dnsbl in DNSBL_LISTS:
         query = f"{reversed_ip}.{dnsbl}"
-        try:
-            dns.resolver.resolve(query, "A")
+        status, answers, _ = resolve_dns(resolver, query, "A", DNS_RETRIES, debug)
+        if status == "ok" and answers:
             listed_in.append(dnsbl)
-        except dns.resolver.NXDOMAIN:
-            pass
-        except Exception:
-            pass
+        elif status == "error" and debug:
+            print(f"[DEBUG] RBL lookup failed for {ip} at {dnsbl}", file=sys.stderr)
 
     return listed_in
 
 
-def check_ptr(ip: str) -> Tuple[bool, List[str]]:
+def check_ptr(ip: str, resolver: dns.resolver.Resolver, debug: bool) -> Tuple[bool, List[str]]:
     """
     Проверка PTR (reverse DNS).
     Возвращает (has_ptr, hostnames)
     """
     try:
         rev = dns.reversename.from_address(ip)
-        answers = dns.resolver.resolve(rev, "PTR")
-    except Exception:
+    except Exception as exc:
+        if debug:
+            print(f"[DEBUG] Failed to build reverse name for {ip}: {exc}", file=sys.stderr)
+        return False, []
+
+    status, answers, _ = resolve_dns(resolver, str(rev), "PTR", DNS_RETRIES, debug)
+    if status != "ok" or answers is None:
         return False, []
 
     hosts: List[str] = []
@@ -352,15 +405,23 @@ def build_overall_status(
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} domains.txt")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Audit email domain DNS health.")
+    parser.add_argument("domains_file", help="Path to file with domains (one per line)")
+    parser.add_argument("--csv", dest="csv_path", help="Optional path to export CSV report")
+    parser.add_argument("--debug", action="store_true", help="Print DNS errors to stderr")
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Print per-domain progress while processing",
+    )
+    args = parser.parse_args()
 
-    domains_file = sys.argv[1]
-    domains = load_domains(domains_file)
+    domains = load_domains(args.domains_file)
     if not domains:
         print("[ERROR] No domains found in file")
         sys.exit(1)
+
+    resolver = make_resolver()
 
     table = PrettyTable()
     table.field_names = [
@@ -381,22 +442,24 @@ def main() -> None:
     table.max_width["Bad IPs"] = 35
     table.align["Bad IPs"] = "l"
 
+    csv_rows: List[List[str]] = []
+
     for domain in domains:
         # MX
-        mx_status, mx_hosts = check_mx(domain)
+        mx_status, mx_hosts = check_mx(domain, resolver, args.debug)
         if mx_status == "OK":
             mx_display = f"OK ({len(mx_hosts)})"
         else:
             mx_display = mx_status
 
         # SPF
-        spf_status, spf_raw, ip4_list = parse_spf(domain)
+        spf_status, spf_raw, ip4_list = parse_spf(domain, resolver, args.debug)
 
         # DMARC
-        dmarc_status, dmarc_raw, rua_present = parse_dmarc(domain)
+        dmarc_status, dmarc_raw, rua_present = parse_dmarc(domain, resolver, args.debug)
 
         # DKIM
-        dkim_status, dkim_selectors = check_dkim(domain)
+        dkim_status, dkim_selectors = check_dkim(domain, resolver, args.debug)
         dkim_display = dkim_status  # "OK" или "unknown"
 
         ip_count = len(ip4_list)
@@ -409,13 +472,13 @@ def main() -> None:
         bad_ip_details: List[str] = []
 
         for ip in ip4_list:
-            listed_in = check_dnsbl(ip)
+            listed_in = check_dnsbl(ip, resolver, args.debug)
             if listed_in:
                 ip_listed_count += 1
                 # полные имена RBL, как вернул check_dnsbl
                 bad_ip_details.append(f"{ip}({','.join(listed_in)})")
 
-            has_ptr, hosts = check_ptr(ip)
+            has_ptr, hosts = check_ptr(ip, resolver, args.debug)
             ptr_total += 1
             if has_ptr:
                 ptr_ok_count += 1
@@ -477,7 +540,7 @@ def main() -> None:
         spf_display = spf_status
         dmarc_display = dmarc_status
 
-        table.add_row([
+        row = [
             domain,
             mx_display,
             spf_display,
@@ -489,9 +552,21 @@ def main() -> None:
             ptr_summary,
             overall_display,
             comment,
-        ])
+        ]
+        table.add_row(row)
+        csv_rows.append(row)
+
+        if args.progress:
+            print(f"[progress] {domain} processed ({overall_display})", file=sys.stderr, flush=True)
 
     print(table)
+
+    if args.csv_path:
+        with open(args.csv_path, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(table.field_names)
+            writer.writerows(csv_rows)
+        print(f"[INFO] CSV report saved to {args.csv_path}")
 
 
 if __name__ == "__main__":
