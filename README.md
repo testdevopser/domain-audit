@@ -367,4 +367,7 @@ Ideas for future improvements:
 
 ## License
 
-Add your preferred license here (MIT, Apache-2.0, GPL-3.0, etc.).
+No warranty! Use at your own risk or not use.
+That's all folks!
+
+--- 
