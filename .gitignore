@@ -16,3 +16,4 @@ ss-domains.txt
 Thumbs.db
 .vscode/
 .idea/
+__pycache__/

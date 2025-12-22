@@ -186,9 +186,13 @@ def parse_spf(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tupl
 
     return status, raw_spf, ip4_list
 
-def parse_dmarc(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tuple[str, Optional[str], bool]:
+def parse_dmarc(
+    domain: str,
+    resolver: dns.resolver.Resolver,
+    debug: bool,
+) -> Tuple[str, Optional[str], bool, Optional[str]]:
     """
-    Возвращает (dmarc_status, raw_dmarc, rua_present)
+    Возвращает (dmarc_status, raw_dmarc, rua_present, inherited_from)
 
     dmarc_status:
         - "missing"
@@ -201,67 +205,86 @@ def parse_dmarc(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tu
         - все DMARC-записи, склеенные через " | "
     rua_present:
         - True, если хотя бы в одной записи есть rua=
+    inherited_from:
+        - домен, у которого нашли DMARC, если для сабдомена он отсутствует
     """
-    dmarc_domain = f"_dmarc.{domain}"
-    status, answers, _ = resolve_dns(resolver, dmarc_domain, "TXT", DNS_RETRIES, debug)
-    if status == "error":
-        return "missing", None, False
-    if answers is None:
-        return "missing", None, False
+    def _lookup_dmarc(target_domain: str) -> Tuple[str, Optional[str], bool]:
+        dmarc_domain = f"_dmarc.{target_domain}"
+        status_local, answers, _ = resolve_dns(resolver, dmarc_domain, "TXT", DNS_RETRIES, debug)
+        if status_local == "error":
+            return "missing", None, False
+        if answers is None:
+            return "missing", None, False
 
-    dmarc_records: List[str] = []
-    for rdata in answers:
-        try:
-            txt = b"".join(rdata.strings).decode("utf-8", errors="ignore")
-        except AttributeError:
-            txt = rdata.to_text().strip('"')
-        if txt.lower().startswith("v=DMARC1".lower()):
-            dmarc_records.append(txt)
+        dmarc_records: List[str] = []
+        for rdata in answers:
+            try:
+                txt = b"".join(rdata.strings).decode("utf-8", errors="ignore")
+            except AttributeError:
+                txt = rdata.to_text().strip('"')
+            if txt.lower().startswith("v=DMARC1".lower()):
+                dmarc_records.append(txt)
 
-    if not dmarc_records:
-        return "missing", None, False
+        if not dmarc_records:
+            return "missing", None, False
 
-    # Парсим все DMARC-записи
-    policies: List[str] = []
-    rua_present_any = False
+        policies: List[str] = []
+        rua_present_any = False
 
-    for raw in dmarc_records:
-        tags: Dict[str, str] = {}
-        for part in raw.split(";"):
-            part = part.strip()
-            if not part or "=" not in part:
-                continue
-            k, v = part.split("=", 1)
-            tags[k.strip().lower()] = v.strip()
+        for raw in dmarc_records:
+            tags: Dict[str, str] = {}
+            for part in raw.split(";"):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                tags[k.strip().lower()] = v.strip()
 
-        p = tags.get("p", "").lower()
-        if p:
-            policies.append(p)
+            p = tags.get("p", "").lower()
+            if p:
+                policies.append(p)
 
-        if "rua" in tags and tags["rua"]:
-            rua_present_any = True
+            if "rua" in tags and tags["rua"]:
+                rua_present_any = True
 
-    unique_policies = set(policies)
+        unique_policies = set(policies)
 
-    # Определяем статус
-    if not unique_policies:
-        status = "unknown"
-    elif len(unique_policies) == 1:
-        p = next(iter(unique_policies))
-        if p == "none":
-            status = "p=none"
-        elif p == "quarantine":
-            status = "p=quarantine"
-        elif p == "reject":
-            status = "p=reject"
+        if not unique_policies:
+            status_resolved = "unknown"
+        elif len(unique_policies) == 1:
+            p = next(iter(unique_policies))
+            if p == "none":
+                status_resolved = "p=none"
+            elif p == "quarantine":
+                status_resolved = "p=quarantine"
+            elif p == "reject":
+                status_resolved = "p=reject"
+            else:
+                status_resolved = "unknown"
         else:
-            status = "unknown"
-    else:
-        # Несколько разных p= — конфликтная конфигурация
-        status = "multiple"
+            status_resolved = "multiple"
 
-    raw_combined = " | ".join(dmarc_records)
-    return status, raw_combined, rua_present_any
+        raw_combined_local = " | ".join(dmarc_records)
+        return status_resolved, raw_combined_local, rua_present_any
+
+    status, raw_combined, rua_present = _lookup_dmarc(domain)
+    inherited_from: Optional[str] = None
+
+    # DMARC отсутствует у сабдомена — пытаемся найти у родительского домена
+    if status == "missing":
+        labels = domain.split(".")
+        if len(labels) > 2:
+            for i in range(1, len(labels) - 1):
+                parent_domain = ".".join(labels[i:])
+                parent_status, parent_raw, parent_rua = _lookup_dmarc(parent_domain)
+                if parent_status != "missing":
+                    status = parent_status
+                    raw_combined = parent_raw
+                    rua_present = parent_rua
+                    inherited_from = parent_domain
+                    break
+
+    return status, raw_combined, rua_present, inherited_from
 
 
 def check_dkim(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tuple[str, List[str]]:
@@ -357,6 +380,7 @@ def build_overall_status(
     ip_listed_count: int,
     ptr_all_ok: bool,
     ptr_some_missing: bool,
+    dmarc_inherited_from: Optional[str],
 ) -> Tuple[str, str]:
     """
     Определяем общий статус домена и короткий комментарий.
@@ -372,7 +396,9 @@ def build_overall_status(
     elif spf_status in ("weak", "multiple"):
         warn_reasons.append(f"SPF {spf_status}")
 
-    if dmarc_status == "missing":
+    if dmarc_inherited_from:
+        warn_reasons.append(f"DMARC inherited ({dmarc_status}) from {dmarc_inherited_from}")
+    elif dmarc_status == "missing":
         fail_reasons.append("DMARC missing")
     elif dmarc_status == "p=none":
         warn_reasons.append("DMARC p=none")
@@ -481,7 +507,7 @@ def main() -> None:
         spf_status, spf_raw, ip4_list = parse_spf(domain, resolver, args.debug)
 
         # DMARC
-        dmarc_status, dmarc_raw, rua_present = parse_dmarc(domain, resolver, args.debug)
+        dmarc_status, dmarc_raw, rua_present, dmarc_inherited_from = parse_dmarc(domain, resolver, args.debug)
 
         # DKIM
         dkim_status, dkim_selectors = check_dkim(domain, resolver, args.debug)
@@ -555,6 +581,7 @@ def main() -> None:
             ip_listed_count=ip_listed_count,
             ptr_all_ok=ptr_all_ok,
             ptr_some_missing=ptr_some_missing,
+            dmarc_inherited_from=dmarc_inherited_from,
         )
 
         # добавляем иконки в Overall
@@ -566,7 +593,10 @@ def main() -> None:
             overall_display = "⚠ WARN"
 
         spf_display = spf_status
-        dmarc_display = dmarc_status
+        if dmarc_inherited_from:
+            dmarc_display = f"{dmarc_status} (from {dmarc_inherited_from})"
+        else:
+            dmarc_display = dmarc_status
 
         row = [
             domain,
