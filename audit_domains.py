@@ -29,7 +29,7 @@ DNSBL_LISTS = [
 # Популярные DKIM-селекторы (best effort, не истина в последней инстанции)
 COMMON_DKIM_SELECTORS = [
     "default", "selector1", "selector2", "google", "mail", "smtp",
-    "mx", "k1", "mail1", "s1", "s2", "dkim",
+    "mx", "k1", "mail1", "s1", "s2", "dkim", "email", "selector",
 ]
 
 DNS_TIMEOUT = 3.0
@@ -287,7 +287,12 @@ def parse_dmarc(
     return status, raw_combined, rua_present, inherited_from
 
 
-def check_dkim(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tuple[str, List[str]]:
+def check_dkim(
+    domain: str,
+    resolver: dns.resolver.Resolver,
+    debug: bool,
+    selectors: List[str],
+) -> Tuple[str, List[str]]:
     """
     Перебираем набор популярных селекторов и ищем DKIM.
     Возвращает (dkim_status, selectors_found):
@@ -298,7 +303,7 @@ def check_dkim(domain: str, resolver: dns.resolver.Resolver, debug: bool) -> Tup
     """
     found_selectors: List[str] = []
 
-    for selector in COMMON_DKIM_SELECTORS:
+    for selector in selectors:
         name = f"{selector}._domainkey.{domain}"
         status, answers, _ = resolve_dns(resolver, name, "TXT", DNS_RETRIES, debug)
         if status != "ok":
@@ -385,10 +390,11 @@ def build_overall_status(
     """
     Определяем общий статус домена и короткий комментарий.
 
-    overall (без иконок): "OK" / "WARN" / "FAIL"
+    overall (без иконок): "GOOD" / "FINE" / "WARN" / "FAIL"
     """
     fail_reasons: List[str] = []
     warn_reasons: List[str] = []
+    fine_reasons: List[str] = []
 
     # SPF / DMARC
     if spf_status == "missing":
@@ -397,11 +403,11 @@ def build_overall_status(
         warn_reasons.append(f"SPF {spf_status}")
 
     if dmarc_inherited_from:
-        warn_reasons.append(f"DMARC inherited ({dmarc_status}) from {dmarc_inherited_from}")
+        fine_reasons.append(f"DMARC inherited ({dmarc_status}) from {dmarc_inherited_from}")
     elif dmarc_status == "missing":
         fail_reasons.append("DMARC missing")
     elif dmarc_status == "p=none":
-        warn_reasons.append("DMARC p=none")
+        fine_reasons.append("DMARC p=none")
     elif dmarc_status == "multiple":
         # несколько разных DMARC-записей — это ошибка конфигурации
         fail_reasons.append("DMARC multiple records")
@@ -434,8 +440,11 @@ def build_overall_status(
     elif warn_reasons:
         overall = "WARN"
         comment = "; ".join(warn_reasons[:3])
+    elif fine_reasons:
+        overall = "FINE"
+        comment = "; ".join(fine_reasons[:3])
     else:
-        overall = "OK"
+        overall = "GOOD"
         if ip_count == 0:
             comment = "SPF/DMARC OK, no ip4 in SPF"
         else:
@@ -460,6 +469,12 @@ def main() -> None:
         help="Skip DNSBL checks (faster, no load on DNSBL providers)",
     )
     parser.add_argument(
+        "--dkim-selector",
+        action="append",
+        dest="dkim_selectors",
+        help="Extra DKIM selectors to check (without '._domainkey'), can be repeated",
+    )
+    parser.add_argument(
         "--rbl-delay",
         type=float,
         default=RBL_DELAY_SECONDS,
@@ -471,6 +486,11 @@ def main() -> None:
     if not domains:
         print("[ERROR] No domains found in file")
         sys.exit(1)
+
+    # Пользовательские селекторы + дефолтные (без дублей, с сохранением порядка)
+    dkim_selectors_to_try: List[str] = list(
+        dict.fromkeys((args.dkim_selectors or []) + COMMON_DKIM_SELECTORS)
+    )
 
     resolver = make_resolver()
 
@@ -491,6 +511,7 @@ def main() -> None:
 
     # чтобы Bad IPs не разъезжались
     table.max_width["Bad IPs"] = 35
+    table.max_width["Comment"] = 35
     table.align["Bad IPs"] = "l"
 
     csv_rows: List[List[str]] = []
@@ -510,8 +531,16 @@ def main() -> None:
         dmarc_status, dmarc_raw, rua_present, dmarc_inherited_from = parse_dmarc(domain, resolver, args.debug)
 
         # DKIM
-        dkim_status, dkim_selectors = check_dkim(domain, resolver, args.debug)
-        dkim_display = dkim_status  # "OK" или "unknown"
+        dkim_status, dkim_selectors = check_dkim(
+            domain,
+            resolver,
+            args.debug,
+            selectors=dkim_selectors_to_try,
+        )
+        if dkim_status == "OK" and dkim_selectors:
+            dkim_display = f"OK ({','.join(dkim_selectors)})"
+        else:
+            dkim_display = dkim_status  # "OK" или "unknown"
 
         ip_count = len(ip4_list)
 
@@ -585,8 +614,10 @@ def main() -> None:
         )
 
         # добавляем иконки в Overall
-        if overall == "OK":
-            overall_display = "✅ OK"
+        if overall == "GOOD":
+            overall_display = "✅ GOOD"
+        elif overall == "FINE":
+            overall_display = "ℹ FINE"
         elif overall == "FAIL":
             overall_display = "❌ FAIL"
         else:

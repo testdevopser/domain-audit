@@ -7,7 +7,7 @@ A small CLI tool to quickly assess the technical health of email domains:
 - IP addresses from SPF
 - RBL / DNSBL checks for IP reputation
 - PTR (reverse DNS)
-- One-line summary per domain: what’s fine and what’s broken
+- One-line summary per domain: what’s fine and what needs attention
 
 The main goal: get a clear, compact report that answers **“where is it OK, and where are the problems?”** for deliverability and reputation.
 
@@ -48,6 +48,7 @@ For each domain, the tool checks:
   - `p=reject`.
   - `missing` — no DMARC record.
   - `unknown` — DMARC exists but `p=` could not be interpreted.
+- If DMARC is absent on a subdomain, the tool will try the parent domain and mark DMARC as inherited when found.
 - Detects whether `rua=` is present (aggregate report address) — used internally for evaluation, not shown in the main table.
 
 ---
@@ -113,7 +114,8 @@ Missing or partial PTR is often a reputation and deliverability red flag.
 
 The tool computes an overall status per domain using SPF, DMARC, MX, RBL and PTR:
 
-- `✅ OK`
+- `✅ GOOD`
+- `ℹ FINE`
 - `⚠ WARN`
 - `❌ FAIL`
 
@@ -125,11 +127,13 @@ The logic (simplified):
   - any IP from SPF is listed in RBL.
 - **WARN** if:
   - SPF is `weak` or `multiple`, or
-  - DMARC is `p=none`, or
   - MX is `missing`/`error`, or
   - PTR is missing for all or some IPs.
-- **OK** if:
-  - No FAIL reasons, no WARN reasons,
+- **FINE** if:
+  - DMARC is inherited from a parent domain, or
+  - DMARC policy is `p=none` (monitoring mode).
+- **GOOD** if:
+  - No FAIL, WARN, or FINE reasons,
   - and DNS / reputation look healthy.
 
 The **Comment** column contains a short explanation like:
@@ -182,7 +186,7 @@ python3 audit_domains.py domains.txt --csv report.csv --debug
 | Domain      | MX      | SPF     | DMARC     | DKIM    | IP from SPF| RBL by IP           | Bad IPs                                       | PTR       | Overall   | Comment                     |
 +-------------+---------+---------+-----------+---------+------------+---------------------+-----------------------------------------------+-----------+-----------+-----------------------------+
 | somedd.com  | OK (3)  | OK      | p=reject  | unknown | 3          | ❌ 3/3 in RBL       | 71.93.250.26(zen.spamhaus.org), ...          | ⚠ 1 missing| ❌ FAIL  | 3 IP in RBL; PTR missing... |
-| mommmin.com | OK (2)  | OK      | p=none    | OK      | 2          | ✅ all 2 clean      | —                                             | ✅ all    | ⚠ WARN    | DMARC p=none                |
+| mommmin.com | OK (2)  | OK      | p=none    | OK      | 2          | ✅ all 2 clean      | —                                             | ✅ all    | ℹ FINE    | DMARC p=none                |
 | anorher.n...| missing | missing | missing   | unknown | 0          | n/a                 | —                                             | n/a       | ❌ FAIL   | SPF missing; DMARC missing  |
 +-------------+---------+---------+-----------+---------+------------+---------------------+-----------------------------------------------+-----------+-----------+-----------------------------+
 ```
@@ -273,12 +277,13 @@ The width of this column is limited in the table and long content will wrap onto
 
 ### Overall
 
-- `✅ OK`  
+- `✅ GOOD`  
   All critical records present, no IPs in RBL, no major DNS issues.
+- `ℹ FINE`  
+  DMARC is present but in monitoring mode (`p=none`) or inherited from a parent domain.
 - `⚠ WARN`  
   Non-critical but important issues, such as:
   - weak or multiple SPF;
-  - DMARC in `p=none` mode;
   - missing/errored MX;
   - partial or missing PTR for IPs.
 - `❌ FAIL`  
@@ -286,7 +291,7 @@ The width of this column is limited in the table and long content will wrap onto
   - missing SPF and/or DMARC;
   - any IP listed in RBL.
 
-The **Comment** column briefly explains why the domain ended up with WARN/FAIL.
+The **Comment** column briefly explains why the domain ended up with FINE/WARN/FAIL.
 
 ---
 
@@ -327,7 +332,7 @@ Add or remove DNSBLs depending on what you use in your environment.
 ```python
 COMMON_DKIM_SELECTORS = [
     "default", "selector1", "selector2", "google", "mail", "smtp",
-    "mx", "k1", "mail1", "s1", "s2", "dkim",
+    "mx", "k1", "mail1", "s1", "s2", "dkim", "email", "selector",
 ]
 ```
 
