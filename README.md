@@ -71,8 +71,8 @@ For each domain, the tool checks:
 ### IPs from SPF
 
 - Collects IP addresses from `ip4:` mechanisms in SPF.
-- Only single IPs are used (`ip4:1.2.3.4`).
-- CIDR ranges like `ip4:1.2.3.0/24` are skipped and not expanded.
+- Expands `include:` and `redirect=` chains to gather downstream `ip4:...`.
+- CIDR ranges are expanded only for small networks (up to 32 addresses); larger ranges are skipped.
 
 ---
 
@@ -82,7 +82,17 @@ For each IP from SPF, the script checks the following DNSBLs:
 
 - `zen.spamhaus.org`
 - `bl.spamcop.net`
+- `cbl.abuseat.org`
+- `b.barracudacentral.org`
 - `dnsbl.sorbs.net`
+- `psbl.surriel.com`
+- `bl.mailspike.net`
+- `dnsbl.dronebl.org`
+- `spam.dnsbl.sorbs.net`
+- `dnsbl-1.uceprotect.net`
+- `db.wpbl.info`
+- `rbl.spamlab.com`
+- `dnsbl-2.uceprotect.net`
 
 In the report you get:
 
@@ -303,7 +313,7 @@ You can customize a few things inside the script:
 
 - `--csv report.csv` — export the same table to CSV for filtering/sorting later.
 - `--debug` — print DNS errors and timeouts to stderr for troubleshooting.
-- `--progress` — print per-domain progress updates while the scan runs.
+- `--progress` — print per-domain progress updates (SPF expansion, per-IP RBL/PTR checks) while the scan runs.
 - `--no-rbl` — skip DNSBL checks entirely (fast, no load on DNSBLs).
 - `--rbl-delay 0.1` — delay between DNSBL queries (seconds) to avoid spamming lists; default: 0.1s.
 
@@ -343,8 +353,9 @@ For your own domains, it can be useful to add the selectors you actually use (`d
 ## Limitations
 
 - **SPF parsing**
-  - The script **does not** expand `include:`, `a`, `mx`, or CIDR ranges like `ip4:x.x.x.x/yy`.
-  - Only plain `ip4:1.2.3.4` entries are used for IP and RBL checks.
+  - `include:` and `redirect=` chains are expanded to collect downstream `ip4:` entries.
+  - `a`/`mx` mechanisms are not expanded.
+  - CIDR ranges are expanded only for small networks (<= 32 addresses); larger ranges are skipped.
 - **DKIM detection**
   - Without reading real email headers (and extracting `s=` from `DKIM-Signature`), selectors cannot be reliably discovered.
   - Status `unknown` means: “No DKIM found among guessed selectors” — **not** “DKIM is missing”.
